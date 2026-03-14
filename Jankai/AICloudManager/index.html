@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Cloud Manager Dashboard</title>
+    <!-- Modern font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Top Navigation -->
+    <nav class="navbar">
+        <div class="logo">
+            <span class="icon">☁️</span> AI Cloud Manager
+        </div>
+        <div class="nav-status">
+            <span class="pulse-dot"></span> System Valid
+        </div>
+    </nav>
+
+    <!-- AWS Configuration Section (Initially Visible) -->
+    <div id="aws-config-container" style="max-width: 600px; margin: 2rem auto; padding: 2rem; background: var(--bg-card); border-radius: 8px; border: 1px solid var(--border-color); box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);">
+        <h2 style="margin-top: 0; margin-bottom: 1.5rem; text-align: center; color: var(--text-main);">Configure AWS Access</h2>
+        <p style="color: var(--text-secondary); margin-bottom: 1.5rem; text-align: center; font-size: 0.95rem;">Enter your AWS Credentials to allow the AI Cloud Manager to securely view and manage your resources. These credentials are only stored temporarily in memory.</p>
+        
+        <div style="display: flex; flex-direction: column; gap: 1rem;">
+            <div>
+                <label for="aws-access-key" style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Access Key ID</label>
+                <input type="text" id="aws-access-key" placeholder="AKIAIOSFODNN7EXAMPLE" style="width: 100%; padding: 0.75rem; background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-main);" />
+            </div>
+            <div>
+                <label for="aws-secret-key" style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Secret Access Key</label>
+                <input type="password" id="aws-secret-key" placeholder="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" style="width: 100%; padding: 0.75rem; background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-main);" />
+            </div>
+            <div>
+                <label for="aws-region" style="display: block; margin-bottom: 0.5rem; font-weight: 500;">Default Region</label>
+                <input type="text" id="aws-region" value="us-east-1" style="width: 100%; padding: 0.75rem; background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-main);" />
+            </div>
+            
+            <button id="aws-connect-btn" style="margin-top: 1rem; padding: 1rem; background: var(--accent-blue); color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 1rem; transition: background 0.2s;">
+                Connect securely
+            </button>
+            <div id="aws-config-status" style="text-align: center; font-weight: 500; font-size: 0.9rem; min-height: 20px;"></div>
+        </div>
+    </div>
+
+    <!-- Main Dashboard Grid (Initially Hidden) -->
+    <main id="main-dashboard-container" class="dashboard-container" style="display: none;">
+        
+        <!-- ACCOUNTS & BILLING ROW (Newly Added) -->
+        <h2 class="section-title">Accounts & Billing</h2>
+        <div class="cards-row billing-row">
+            <div class="card stat-card border-purple">
+                <h3>Current Run Rate</h3>
+                <div class="stat-subtitle">Hourly burn for running instances</div>
+                <div class="stat-value text-accent" id="stat-runrate">$0.00 / hr</div>
+            </div>
+            <div class="card stat-card border-green">
+                <h3>Savings Rate</h3>
+                <div class="stat-subtitle">Money saved automatically by AI</div>
+                <div class="stat-value text-success" id="stat-saverate">$0.00 / hr</div>
+            </div>
+            <div class="card stat-card highlight-card">
+                <h3>Cumulative AI Savings</h3>
+                <div class="stat-subtitle">Total money saved to date</div>
+                <div class="stat-value text-success" id="stat-savings-total">$0.00</div>
+            </div>
+        </div>
+
+        <!-- NEW: S3 File Management -->
+        <h2 class="section-title">S3 File Management</h2>
+        <div class="cards-row s3-container" style="margin-bottom: 2rem;">
+            <div class="card stat-card" style="width: 100%; display: flex; flex-direction: column; gap: 1rem;">
+                <h3>Upload File to AWS S3</h3>
+                <div style="display: flex; gap: 1rem; align-items: center; flex-wrap: wrap;">
+                    <select id="s3-bucket-select" style="padding: 0.5rem; background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-main); min-width: 200px;">
+                        <option value="">Loading buckets...</option>
+                    </select>
+                    <input type="file" id="s3-file-input" style="flex: 1; padding: 0.5rem; background: var(--bg-main); border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-main);" />
+                    <button id="s3-upload-btn" style="padding: 0.5rem 1rem; background: var(--accent-blue); color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 500;">Upload to S3</button>
+                    <div id="s3-upload-status" style="width: 100%; font-size: 0.9rem; font-weight: 500;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- System Overview Section -->
+        <h2 class="section-title">System Overview</h2>
+        <!-- Top Row: Overview Cards -->
+        <div class="cards-row">
+            <div class="card stat-card">
+                <h3>Total Instances</h3>
+                <div class="stat-value" id="stat-total">0</div>
+            </div>
+            <div class="card stat-card">
+                <h3>Running Instances</h3>
+                <div class="stat-value text-accent" id="stat-running">0</div>
+            </div>
+            <div class="card stat-card highlight-card">
+                <h3>Cost Optimization</h3>
+                <div class="stat-subtitle">Estimated Savings Today</div>
+                <div class="stat-value text-success" id="stat-savings">$0.00</div>
+            </div>
+        </div>
+
+        <!-- Middle Row: Chart & Instances Table -->
+        <div class="main-content-row">
+            <!-- CPU Chart -->
+            <div class="card chart-container">
+                <h2>Average CPU Usage Distribution</h2>
+                <div class="chart-wrapper">
+                    <canvas id="cpuChart"></canvas>
+                </div>
+            </div>
+            
+            <!-- Instances Table -->
+            <div class="card table-container">
+                <h2>EC2 Instances</h2>
+                <table id="instances-table">
+                    <thead>
+                        <tr>
+                            <th>Instance ID</th>
+                            <th>Status</th>
+                            <th>CPU Usage</th>
+                            <th>AI Action Taken</th>
+                        </tr>
+                    </thead>
+                    <tbody id="instances-body">
+                        <!-- Populated by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- NEW: Individual CPU Monitors -->
+        <h2 class="section-title">Per-Instance Resource Monitors</h2>
+        <div class="cpu-monitor-grid" id="cpu-monitors-container">
+            <!-- Populated dynamically by JS -->
+            <!-- Example format: 
+                <div class="monitor-card">
+                    <h4>i-0123456789</h4>
+                    <span>Status: Running</span>
+                    <div class="progress-bar-container">
+                        <div class="progress-fill" style="width: 45%;"></div>
+                    </div>
+                    <span class="cpu-text">45% CPU</span>
+                </div>
+            -->
+        </div>
+
+        <!-- Bottom Row: Logs & Chat -->
+        <div class="bottom-content-row">
+            <!-- Action Logs -->
+            <div class="card logs-container">
+                <h2>AI Action Log</h2>
+                <div class="log-list" id="ai-logs">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+            
+            <!-- Chatbot History -->
+            <div class="card chat-container">
+                <h2>Chatbot Command History</h2>
+                <div class="chat-history" id="chat-history">
+                    <!-- Populated by JS -->
+                </div>
+                <!-- NEW: Chat Input Box -->
+                <div class="chat-input-container">
+                    <input type="text" id="chat-input" placeholder="Type a command (e.g., 'Start instance i-123')..." autocomplete="off">
+                    <button id="chat-send-btn">Send</button>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
