@@ -1,4 +1,4 @@
 .env
-*.env
+*.pem
 __pycache__/
-node_modules/
+*.zip

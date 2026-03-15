@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+boto3
+python-dotenv
+langchain-aws
+langgraph
+pydantic
+python-multipart

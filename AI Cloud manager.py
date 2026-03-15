@@ -5,13 +5,13 @@ import datetime
 import boto3
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel as FastAPIBaseModel
 import uvicorn
 
-from langchain_openai import ChatOpenAI
+
 from langchain_core.messages import HumanMessage, SystemMessage
 from typing_extensions import TypedDict, Literal
 from pydantic import Field, BaseModel
@@ -25,33 +25,6 @@ global_logs = []
 global_chat = []
 total_savings = 0.0
 
-# --- Global AWS Credentials ---
-aws_credentials = {
-    "aws_access_key_id": None,
-    "aws_secret_access_key": None,
-    "region_name": "us-east-1"
-}
-
-def get_boto3_client(service_name):
-    if aws_credentials["aws_access_key_id"] and aws_credentials["aws_secret_access_key"]:
-        return boto3.client(
-            service_name,
-            aws_access_key_id=aws_credentials["aws_access_key_id"],
-            aws_secret_access_key=aws_credentials["aws_secret_access_key"],
-            region_name=aws_credentials["region_name"]
-        )
-    return boto3.client(service_name) # Fallback to environment/profile
-
-def get_boto3_resource(service_name):
-    if aws_credentials["aws_access_key_id"] and aws_credentials["aws_secret_access_key"]:
-        return boto3.resource(
-            service_name,
-            aws_access_key_id=aws_credentials["aws_access_key_id"],
-            aws_secret_access_key=aws_credentials["aws_secret_access_key"],
-            region_name=aws_credentials["region_name"]
-        )
-    return boto3.resource(service_name) # Fallback to environment/profile
-
 def add_log(msg):
     now_str = datetime.datetime.now().strftime("%I:%M %p")
     global_logs.append(f"[{now_str}] {msg}")
@@ -62,22 +35,27 @@ def add_chat(sender, text):
 
 add_log("System initialized securely. Monitoring active.")
 
-# --- LangGraph Setup ---
-llm = ChatOpenAI(model="gpt-4o-mini")
+from langchain_aws import ChatBedrockConverse
+from botocore.exceptions import ClientError
+
+def get_llm():
+    return ChatBedrockConverse(
+        model="us.amazon.nova-lite-v1:0",  # or nova‑pro / nova‑micro / nova‑2‑lite
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY")
+    )
 
 class Route(BaseModel):
     step: Literal["EC2", "S3", "VPC", "chatbot"] = Field(description="The next routing step based on the prompt")
 
 class Route1(BaseModel):
     step: Literal["create", "upload"] = Field(description="The next step for AWS S3")
+    bucket_name: str = Field(default="", description="The specific S3 bucket name mentioned by the user, if any.")
 
 class Route2(BaseModel):
     step: Literal["create", "start", "stop", "terminate"] = Field(description="The next step for AWS EC2")
     instance_id: str = Field(default="", description="The specific EC2 instance ID mentioned by the user (like i-xxxx), if any.")
-    
-router = llm.with_structured_output(Route)
-router1 = llm.with_structured_output(Route1)
-router2 = llm.with_structured_output(Route2)
 
 class State(TypedDict):
     input: str
@@ -93,21 +71,17 @@ def llm_call_route(state: State):
     user_input = state.get("input", "").lower()
     
     # 1. Immediate Manual Mock Override for Hackathon (No API Key needed)
-    if "start" in user_input and "instance" in user_input:
-        return {"decision": "EC2_Q"}
-    elif "stop" in user_input and "instance" in user_input:
-         return {"decision": "EC2_Q"}
-    elif "terminate" in user_input and "instance" in user_input:
-         return {"decision": "EC2_Q"}
-    elif "create" in user_input and "instance" in user_input:
-         return {"decision": "EC2_Q"}
+    if "savings" in user_input or "money" in user_input:
+        return {"decision": "chatbot"}
     
     # 2. General FAQ
     if user_input.startswith(("what", "who", "how", "explain")):
         return {"decision": "chatbot"}
         
-    # 3. Fallback to LangGraph Router (will fail if API key bad, but wrapped in try/except)
+    # 3. Fallback to LangGraph Router
     try:
+        llm = get_llm()
+        router = llm.with_structured_output(Route)
         decision = router.invoke([
             SystemMessage(content="This will route the user input to exactly one of: chatbot, EC2, S3, or VPC."),
             HumanMessage(content=user_input)
@@ -131,21 +105,27 @@ def route_decision(state: State):
 # --- S3 Operations ---
 def S3_Q(state: State):
     try:
+        llm = get_llm()
+        router1 = llm.with_structured_output(Route1)
         decision1 = router1.invoke([
-            SystemMessage(content="Route the input to either 'create' (create bucket) or 'upload' (upload file)."),
+            SystemMessage(content="Route the input to either 'create' (create bucket) or 'upload' (upload file). Extract any mentioned S3 bucket name if present."),
             HumanMessage(content=state.get("input", ""))
         ])
         d1_step = decision1.step
+        bucket_name = decision1.bucket_name
     except:
         d1_step = "create"
-    return {"decision1": d1_step}
+        bucket_name = ""
+    
+    target_bucket = bucket_name if bucket_name else "dct-crud-" + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    return {"decision1": d1_step, "bucket_name": target_bucket}
 
 def route_decision1(state: State):
     return "create" if state.get("decision1") == "create" else "upload"
 
 def create(state: State):
     s3 = boto3.resource('s3')
-    bucket_name = "dct-crud-1-20260303"
+    bucket_name = state.get("bucket_name", "dct-crud-default-" + datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
     msg = ""
     try:
         existing_buckets = [b.name for b in s3.buckets.all()]
@@ -193,23 +173,17 @@ def EC2_Q(state: State):
             embedded_id = clean_word
             break
             
-    # Manual Override Routing (No API Key)
-    if "start" in user_input:
-        return {"decision2": "start", "ID": embedded_id}
-    elif "stop" in user_input:
-        return {"decision2": "stop", "ID": embedded_id}
-    elif "terminate" in user_input:
-        return {"decision2": "terminate", "ID": embedded_id}
-        
-    # Fallback to LLM Extraction
+    # LLM Extraction
     try:
+        llm = get_llm()
+        router2 = llm.with_structured_output(Route2)
         decision2 = router2.invoke([
             SystemMessage(content="Route the input to one of the following EC2 actions: create, start, stop, terminate. Crucially, extract any mentioned instance-id (e.g., i-0abcdef1234) from the prompt if present."),
             HumanMessage(content=state.get("input", ""))
         ])
         
         # Determine the target Instance ID. Preference to the one found in the prompt.
-        found_id = getattr(decision2, 'instance_id', None)
+        found_id = getattr(decision2, 'instance_id', "")
         target_id = found_id if found_id else (embedded_id if embedded_id else state.get("ID", ""))
         
         return {"decision2": decision2.step, "ID": target_id}
@@ -230,9 +204,13 @@ def create_instance(state: State):
     msg = ""
     instance_id = "error_id"
     try:
+        ssm = boto3.client('ssm', region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+        ami_response = ssm.get_parameter(Name='/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64')
+        ami_id = ami_response['Parameter']['Value']
+        
         new_instance = ec2.create_instances(
-            ImageId='ami-0f3caa1cf4417e51b',
-            MinCount=1, MaxCount=1, InstanceType='t3.micro', KeyName='usa-east-kp',
+            ImageId=ami_id,
+            MinCount=1, MaxCount=1, InstanceType='t3.micro',
             TagSpecifications=[{'ResourceType': 'instance', 'Tags': [{'Key': 'Name', 'Value': 'dt-ec2-hol'}]}]
         )
         instance_id = str(new_instance[0].id)
@@ -242,94 +220,15 @@ def create_instance(state: State):
     add_log(msg)
     return {"ID": instance_id, "bot_response": msg}
 
-def list_instances():
-    """Returns a list of all instances in the account."""
-    ec2 = get_boto3_resource('ec2')
-    instances_list = []
-    for instance in ec2.instances.all():
-        name = "Unknown"
-        for tag in instance.tags or []:
-            if tag['Key'] == 'Name':
-                name = tag['Value']
-                break
-        
-        status = instance.state['Name']
-        hours_running = 0
-        
-        instances_list.append({
-            "id": instance.id,
-            "name": name,
-            "status": status,
-            "type": instance.instance_type,
-            "launch_time": instance.launch_time,
-            "hours_running": hours_running # Placeholder, needs calculation
-        })
-    return instances_list
-
-def check_cpu_utilization(instance_id):
-    """
-    Fetches real CPU utilization from AWS CloudWatch over the last 10 minutes.
-    Returns the most recent Average CPU data point available.
-    """
-    cw = get_boto3_client('cloudwatch')
-    
-    # CloudWatch basic monitoring updates every 5 minutes, so we look back 10 mins 
-    # to ensure we capture at least one recent data point.
-    end_time = datetime.datetime.utcnow()
-    start_time = end_time - datetime.timedelta(minutes=10)
-    
-    try:
-        response = cw.get_metric_statistics(
-            Namespace='AWS/EC2',
-            MetricName='CPUUtilization',
-            Dimensions=[
-                {
-                    'Name': 'InstanceId',
-                    'Value': instance_id
-                },
-            ],
-            StartTime=start_time,
-            EndTime=end_time,
-            Period=300, # 5 minute intervals (300 seconds)
-            Statistics=['Average']
-        )
-        
-        datapoints = response.get('Datapoints', [])
-        
-        if not datapoints:
-            return 0  # No data available yet (e.g. instance just launched)
-            
-        # CloudWatch doesn't guarantee order, so sort by Timestamp to get the latest
-        latest_datapoint = sorted(datapoints, key=lambda x: x['Timestamp'])[-1]
-        
-        # Return percentage rounded to 1 decimal place
-        return round(latest_datapoint['Average'], 1)
-        
-    except Exception as e:
-        print(f"Error fetching CloudWatch data for {instance_id}: {e}")
-        return 0
-
-def manage_instance(instance_id, action):
-    """Starts, stops, or terminates an EC2 instance."""
-    ec2_client = get_boto3_client('ec2')
-    
-    if action == "start":
-        ec2_client.start_instances(InstanceIds=[instance_id])
-    elif action == "stop":
-        ec2_client.stop_instances(InstanceIds=[instance_id])
-    elif action == "terminate":
-        ec2_client.terminate_instances(InstanceIds=[instance_id])
-    else:
-        raise ValueError(f"Invalid action {action}")
-
 def start_instance(state: State):
-    ec2_client = get_boto3_client("ec2")
+    ec2 = boto3.resource("ec2")
     instance_id = state.get('ID')
     msg = ""
     
     if not instance_id or instance_id == "error_id":
         try:
-            reservations = ec2_client.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['stopped', 'pending']}]).get("Reservations", [])
+            client = boto3.client('ec2', region_name='us-east-1')
+            reservations = client.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['stopped', 'pending']}]).get("Reservations", [])
             stopped_instances = [inst["InstanceId"] for r in reservations for inst in r.get("Instances", [])]
             if len(stopped_instances) > 0:
                 instance_id = stopped_instances[0]
@@ -340,7 +239,7 @@ def start_instance(state: State):
             
     if instance_id and instance_id != "error_id":
         try:
-            manage_instance(instance_id, "start")
+            ec2.Instance(instance_id).start()
             msg += f"Instance {instance_id} has been commanded to start."
         except Exception as e:
             msg = f"Error starting instance: {e}"
@@ -350,13 +249,14 @@ def start_instance(state: State):
     return {"bot_response": msg}
 
 def stop_instance(state: State):
-    ec2_client = get_boto3_client("ec2")
+    ec2 = boto3.resource("ec2")
     instance_id = state.get('ID')
     msg = ""
     
     if not instance_id or instance_id == "error_id":
         try:
-            reservations = ec2_client.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]).get("Reservations", [])
+            client = boto3.client('ec2', region_name='us-east-1')
+            reservations = client.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]).get("Reservations", [])
             running_instances = [inst["InstanceId"] for r in reservations for inst in r.get("Instances", [])]
             if len(running_instances) > 0:
                 instance_id = running_instances[0]
@@ -367,7 +267,7 @@ def stop_instance(state: State):
             
     if instance_id and instance_id != "error_id":
         try:
-            manage_instance(instance_id, "stop")
+            ec2.Instance(instance_id).stop()
             msg += f"Instance {instance_id} has been commanded to stop."
         except Exception as e:
             msg = f"Error stopping instance: {e}"
@@ -377,13 +277,14 @@ def stop_instance(state: State):
     return {"bot_response": msg}
 
 def terminate_instance(state: State):
-    ec2_client = get_boto3_client("ec2")
+    ec2 = boto3.resource("ec2")
     instance_id = state.get('ID')
     msg = ""
     
     if not instance_id or instance_id == "error_id":
         try:
-            reservations = ec2_client.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running', 'stopped']}]).get("Reservations", [])
+            client = boto3.client('ec2', region_name='us-east-1')
+            reservations = client.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running', 'stopped']}]).get("Reservations", [])
             instances = [inst["InstanceId"] for r in reservations for inst in r.get("Instances", [])]
             if len(instances) > 0:
                 instance_id = instances[0]
@@ -394,7 +295,7 @@ def terminate_instance(state: State):
             
     if instance_id and instance_id != "error_id":
         try:
-            manage_instance(instance_id, "terminate")
+            ec2.Instance(instance_id).terminate()
             msg += f"Instance {instance_id} has been terminated."
         except Exception as e:
             msg = f"Error terminating instance: {e}"
@@ -405,7 +306,7 @@ def terminate_instance(state: State):
 
 # --- VPC Operations ---
 def VPC_Q(state: State):
-    ec2 = get_boto3_client('ec2')
+    ec2 = boto3.client('ec2')
     vpc_name = 'vpc-hol'
     msg = ""
     try:
@@ -429,22 +330,24 @@ def VPC_Q(state: State):
 def chatbot(state: State):
     user_input = state.get("input", "").lower()
     
-    # Manual Override Hackathon Responses
     if "savings" in user_input or "money" in user_input:
         state["bot_response"] = f"Your current AI auto-stop savings is ${total_savings:.2f}. Instances with <5% CPU are stopped automatically to save $0.45/hr."
         return state
-    elif "instance" in user_input and "what" in user_input:
-         state["bot_response"] = "A micro instance like t3.micro provides burstable compute performance and is cost-effective for testing."
-         return state
          
     try:
+        llm = get_llm()
         answer = llm.invoke(input=[
             SystemMessage(content="You are a helpful AWS Cloud Manager assistant. Answer clearly and concisely."),
             HumanMessage(content=state.get("input", ""))
         ])
         state["bot_response"] = answer.content
+    except ClientError as e:
+        if "AccessDeniedException" in str(e):
+            state["bot_response"] = "I am unable to connect to Amazon Nova because your AWS IAM user does not have permission to use Bedrock (bedrock:InvokeModel). However, you can still type commands like 'Start instance i-xxxx'!"
+        else:
+             state["bot_response"] = f"A cloud API error occurred: {e}"
     except Exception as e:
-         state["bot_response"] = f"I am unable to connect to OpenAI because the API key is missing. However, you can still type commands like 'Start instance i-xxxx' to manage your EC2 servers directly!"
+         state["bot_response"] = "I am unable to connect to Amazon Nova because the API key might be missing or invalid. However, you can still type commands like 'Start instance i-xxxx' to manage your EC2 servers directly!"
     return state
 
 # --- Build Graph ---
@@ -479,44 +382,46 @@ graph = builder.compile()
 
 # --- Background Thread for Auto-stop ---
 def monitor_and_stop_idle_instances():
-    """Background thread that continuously checks for idle instances to stop them, saving money."""
     global total_savings
+    ec2 = boto3.client('ec2')
+    cloudwatch = boto3.client('cloudwatch')
+    
     while True:
-        # Only run if AWS credentials exist
-        if not aws_credentials.get("aws_access_key_id"):
-            time.sleep(10)
-            continue
-            
         try:
-            instances = list_instances()
-            for inst in instances:
-                if inst['status'] == 'running':
-                    inst_id = inst['id']
-                    cpu_val = check_cpu_utilization(inst_id) # Using the mock function
-                    
-                    is_idle = (cpu_val < 5)
-                    
-                    if is_idle:
-                        msg = f"Instance {inst_id} detected as IDLE (<5% CPU). Auto-stopping to save costs..."
-                        add_log(msg)
-                        manage_instance(inst_id, "stop")
-                        total_savings += 0.45
+            instances = ec2.describe_instances(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+            running_instance_ids = [i['InstanceId'] for r in instances.get('Reservations', []) for i in r.get('Instances', [])]
+            for inst_id in running_instance_ids:
+                now = datetime.datetime.utcnow()
+                past_5_mins = now - datetime.timedelta(minutes=5)
+                metrics = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/EC2', MetricName='CPUUtilization',
+                    Dimensions=[{'Name': 'InstanceId', 'Value': inst_id}],
+                    StartTime=past_5_mins, EndTime=now, Period=60, Statistics=['Average']
+                )
+                datapoints = metrics.get('Datapoints', [])
+                if not datapoints: continue
+                
+                datapoints.sort(key=lambda x: x['Timestamp'])
+                latest_points = datapoints[-2:]
+                
+                is_idle = True
+                for point in latest_points:
+                    if point['Average'] >= 5.0:
+                        is_idle = False
+                        break
+                
+                if is_idle and len(latest_points) > 0:
+                    msg = f"Instance {inst_id} detected as IDLE (<5% CPU). Auto-stopping to save costs..."
+                    add_log(msg)
+                    ec2.stop_instances(InstanceIds=[inst_id])
+                    total_savings += 0.45
         except Exception as e:
             pass # Suppress output so it doesn't spam logs
             
         time.sleep(120)
 
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Start the idle auto-stop background thread
-    monitor_thread = threading.Thread(target=monitor_and_stop_idle_instances, daemon=True)
-    monitor_thread.start()
-    yield
-
 # --- FastAPI App ---
-app = FastAPI(title="AI Cloud Manager API", lifespan=lifespan)
+app = FastAPI(title="AI Cloud Manager API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -526,33 +431,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class AWSCredentials(BaseModel):
+@app.get("/", response_class=HTMLResponse)
+def get_index():
+    with open("AICloudManager/index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/style.css")
+def get_css():
+    with open("AICloudManager/style.css", "r", encoding="utf-8") as f:
+        return Response(content=f.read(), media_type="text/css")
+
+@app.get("/script.js")
+def get_js():
+    with open("AICloudManager/script.js", "r", encoding="utf-8") as f:
+        return Response(content=f.read(), media_type="application/javascript")
+
+@app.on_event("startup")
+def startup_event():
+    # Start the idle auto-stop background thread
+    monitor_thread = threading.Thread(target=monitor_and_stop_idle_instances, daemon=True)
+    monitor_thread.start()
+
+class AWSCredentials(FastAPIBaseModel):
     aws_access_key_id: str
     aws_secret_access_key: str
-    region_name: str = "us-east-1"
+    region_name: str
 
 @app.post("/api/credentials")
 def set_credentials(creds: AWSCredentials):
-    aws_credentials["aws_access_key_id"] = creds.aws_access_key_id
-    aws_credentials["aws_secret_access_key"] = creds.aws_secret_access_key
-    aws_credentials["region_name"] = creds.region_name
+    os.environ['AWS_ACCESS_KEY_ID'] = creds.aws_access_key_id
+    os.environ['AWS_SECRET_ACCESS_KEY'] = creds.aws_secret_access_key
+    os.environ['AWS_DEFAULT_REGION'] = creds.region_name
     
-    # Test connection
+    boto3.setup_default_session(
+        aws_access_key_id=creds.aws_access_key_id,
+        aws_secret_access_key=creds.aws_secret_access_key,
+        region_name=creds.region_name
+    )
+    
     try:
-        sts = get_boto3_client('sts')
+        sts = boto3.client('sts')
         identity = sts.get_caller_identity()
-        user_arn = identity.get('Arn', 'Unknown')
-        add_log(f"AWS connected successfully. Identity: {user_arn}")
-        return {"status": "success", "message": "Connected successfully"}
+        add_log(f"AWS connected successfully. Identity: {identity.get('Arn')}")
+        return {"message": "Connected successfully!"}
     except Exception as e:
-        # Revert on failure
-        aws_credentials["aws_access_key_id"] = None
-        aws_credentials["aws_secret_access_key"] = None
-        add_log(f"Failed to connect to AWS: {str(e)}")
-        from fastapi import HTTPException
-        raise HTTPException(status_code=401, detail="Invalid AWS Credentials or network error.")
+        raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/api/s3-buckets")
+def get_s3_buckets():
+    try:
+        s3 = boto3.client('s3')
+        response = s3.list_buckets()
+        buckets = [b['Name'] for b in response.get('Buckets', [])]
+        return {"buckets": buckets}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
+@app.post("/api/upload")
+async def s3_upload(file: UploadFile = File(...), bucket_name: str = Form(...)):
+    try:
+        s3 = boto3.client('s3')
+        s3.upload_fileobj(file.file, bucket_name, file.filename)
+        msg = f"Successfully uploaded {file.filename} to {bucket_name}"
+        add_log(msg)
+        return {"message": msg}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 class ChatRequest(FastAPIBaseModel):
     message: str
@@ -571,99 +515,79 @@ def chat_endpoint(req: ChatRequest):
     add_chat("bot", bot_resp)
     return {"status": "success"}
 
-@app.post("/api/upload")
-async def upload_file_endpoint(file: UploadFile = File(...), bucket_name: str = Form("dct-crud-1-20260303")):
-    add_log(f"Received file upload request: {file.filename} intended for bucket: {bucket_name}")
-    s3 = get_boto3_client('s3')
-    
-    try:
-        # Read file content into memory
-        file_content = await file.read()
-        
-        # Upload directly from memory
-        s3.put_object(
-            Bucket=bucket_name,
-            Key=file.filename,
-            Body=file_content
-        )
-        msg = f"Successfully uploaded {file.filename} to S3 bucket {bucket_name}."
-        add_log(msg)
-        return {"status": "success", "message": msg}
-    except Exception as e:
-        msg = f"Failed to upload file to S3: {str(e)}"
-        add_log(msg)
-        from fastapi import HTTPException
-        raise HTTPException(status_code=500, detail=msg)
-
-@app.get("/api/s3-buckets")
-def get_s3_buckets():
-    s3 = get_boto3_client('s3')
-    try:
-        response = s3.list_buckets()
-        buckets = [bucket['Name'] for bucket in response.get('Buckets', [])]
-        return {"status": "success", "buckets": buckets}
-    except Exception as e:
-        add_log(f"Error fetching S3 buckets: {e}")
-        from fastapi import HTTPException
-        raise HTTPException(status_code=500, detail="Could not fetch S3 buckets")
-
 @app.get("/api/dashboard")
 def get_dashboard():
+    ec2 = boto3.client('ec2')
+    cloudwatch = boto3.client('cloudwatch')
+    instances_data = []
+    
     try:
-        instances = list_instances() # Use the new helper
-        
-        running_count = 0
-        stopped_count = 0
-        instances_data = []
-        
-        for inst in instances:
-            state_name = inst["status"].lower()
-            inst_id = inst["id"]
-            action_text = "None"
-            
-            if state_name == "running":
-                running_count += 1
-                cpu_val = check_cpu_utilization(inst_id) # Using mocked CPU for now
-                if cpu_val < 5:
-                    action_text = "Monitoring (<5% CPU) - Preparing auto-stop"
-                elif cpu_val > 80:
-                    action_text = "High Output (>80%) - AI scaling preparing"
-                else:
-                    action_text = "Optimal Performance"
-            elif state_name == "stopped":
-                stopped_count += 1
-                cpu_val = 0
-                action_text = "Instance is sleeping (Cost Saved)"
-            else:
+        reservations = ec2.describe_instances().get("Reservations", [])
+        for r in reservations:
+            for inst in r.get("Instances", []):
+                inst_id = inst["InstanceId"]
+                state_name = inst["State"]["Name"]
+                status = "Stopped"
+                action_text = ""
                 cpu_val = 0
                 
-            instances_data.append({
-                "id": inst_id,
-                "status": state_name.capitalize(),
-                "cpu": cpu_val,
-                "action": action_text
-            })
-            
-        return {
-            "instances": instances_data,
-            "logs": list(reversed(global_logs[-20:])), # Reverse to show newest on top
-            "chat": global_chat[-50:],
-            "savings": total_savings,
-            "totalCount": len(instances_data),
-            "runningCount": running_count,
-            "runRate": running_count * 0.45,
-            "savingsRate": stopped_count * 0.45
-        }
+                if state_name == "running":
+                    status = "Running"
+                    
+                    # Fetch immediate CPU usage
+                    now = datetime.datetime.utcnow()
+                    past = now - datetime.timedelta(minutes=5)
+                    metrics = cloudwatch.get_metric_statistics(
+                        Namespace='AWS/EC2', MetricName='CPUUtilization',
+                        Dimensions=[{'Name': 'InstanceId', 'Value': inst_id}],
+                        StartTime=past, EndTime=now, Period=300, Statistics=['Average']
+                    )
+                    dps = metrics.get('Datapoints', [])
+                    if dps:
+                        dps.sort(key=lambda x: x['Timestamp'])
+                        cpu_val = int(dps[-1]['Average'])
+                        
+                    if cpu_val < 5:
+                        status = "Idle"
+                        action_text = "Monitoring (<5% CPU) - Preparing auto-stop"
+                    elif cpu_val > 80:
+                        action_text = "High Output (>80%) - AI scaling preparing"
+                    else:
+                        action_text = "Optimal Performance"
+                        
+                elif state_name == "stopped":
+                    status = "Stopped"
+                    action_text = "Instance is sleeping (Cost Saved)"
+                elif state_name in ["shutting-down", "terminated"]:
+                    status = "Terminated"
+                    action_text = "Instance permanently terminated"
+                else:
+                    status = "Pending"
+                    action_text = "Provisioning instance..."
+
+                instances_data.append({
+                    "id": inst_id,
+                    "status": status,
+                    "cpu": cpu_val,
+                    "action": action_text
+                })
     except Exception as e:
-        print("Error fetching dynamic data:", e)
-        return {"error": str(e)}
+        pass # In a real system, log to a secure store.
+        
+    running_count = sum(1 for x in instances_data if x['status'] in ['Running', 'Idle'])
+    stopped_count = sum(1 for x in instances_data if x['status'] == 'Stopped')
 
-from fastapi.responses import FileResponse
-@app.get("/")
-def read_root():
-    return FileResponse("AICloudManager/index.html")
-
-app.mount("/static", StaticFiles(directory="AICloudManager"), name="static")
+    # Return structured data that matches the frontend UI expectations
+    return {
+        "instances": instances_data,
+        "logs": list(reversed(global_logs[-20:])), # Reverse to show newest on top
+        "chat": global_chat[-50:],
+        "savings": f"{total_savings:.2f}",
+        "totalCount": len(instances_data),
+        "runningCount": running_count,
+        "runRate": running_count * 0.45,
+        "savingsRate": stopped_count * 0.45
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
